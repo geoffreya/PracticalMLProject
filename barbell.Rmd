@@ -1,0 +1,440 @@
+---
+title: "Predicting Barbell Exercise Classification from Wearable Accelerometer Data"
+author: "Geoffrey Anderson"
+date: "11/22/2014"
+output: html_document
+---
+
+## Synopsis
+
+This study makes use of data from several accelerometers worn by test subjects
+who lifted barbells and dumbells. They were asked to perform barbell lifts 
+correctly and incorrectly in 5 different ways. The goal of this machine learning
+study is to predict from accelerometer data the correctness manner 
+(classe = A,B,C,D,E) in which the subjects did some gym exercise. 
+
+The final model selected was gbm, which is a boosted regression tree. 
+53 columns were used to train the model, out of the 100+ columns in the raw 
+data set. 
+No imputing of missing values was performed.
+Repeated cross validation was used during model training. 
+99% prediction accuracy was achieved on the testing data set. 
+100% prediction accuracy was achieved on the 20 observation graded test sample.
+
+## Data processing
+
+It was necessary to tidy many columns by manually inspecting
+some of the data directly. Also, searches and repairs for data problems
+were done using automated techniques.
+In the end, only about half of the columns from the original data set were used
+to train the final model.
+I made training and testing partitions of the data.
+Strictly the training partition was used for all tidying and data processing
+purposes, so as to avoid inappropriate snooping on the test set which would
+be used for assessing the selected model's accuracy on out-of-sample data.
+
+Here is how the retained columns were selected:
+
+- Certain columns were seen to be worthless, because they simply had no actual data.
+I deleted such columns.
+
+- Some columns had obvious mis-spellings in the column name, such
+as picth instead of pitch. I corrected the spelling in such column names.
+
+- Several columns had 90% or more missing values (NA). I deleted such
+columns. There is generally no benefit in keeping columns having more 
+than 60% missing data, according to my review of resources on the internet.
+
+- Near zero variance was discovered in some columns, and I deleted such columns.
+
+- Many columns were factors but should have been numeric, as you could
+see by looking at some of the data.  I transformed many such incorrectly
+identified factor columns into numeric columns.
+
+- We will not use the observation number (X) column in the training data, which 
+effectively identifies the classe. Preliminary analysis revealed that classe is 
+associated with observation number. If we used X there would be no need to do
+any machine learning. **Notably, there is also a 20-observation test set
+provided by the course instructor, which is missing the columns for classe and 
+ the observation number (X).** Thus, it is vitally important to really be able
+to accurately predict the classe from the accelerometer data alone.
+
+### Loading the raw data
+
+```{r LoadData}
+library(caret)
+library(xtable)
+library(knitr)
+library(doMC)
+registerDoMC(cores=3)
+set.seed(123) # For reproducibility by other people
+
+df <- read.csv('pml-training.csv', header=TRUE)
+```
+
+### Repairing bad column names
+
+```{r RepairNames}
+df$kurtosis_picth_belt <- df$kurtosis_pitch_belt
+df$kurtosis_picth_belt <- NULL
+
+df$max_picth_belt <- df$max_pitch_belt
+df$max_picth_belt <- NULL
+
+df$kurtosis_picth_arm <- df$kurtosis_pitch_arm
+df$kurtosis_picth_arm <- NULL
+
+df$max_picth_arm <- df$max_pitch_arm
+df$max_picth_arm <- NULL
+
+df$kurtosis_picth_dumbbell <- df$kurtosis_pitch_dumbbell
+df$kurtosis_picth_dumbbell <- NULL
+
+df$max_picth_dumbbell <- df$max_pitch_dumbbell
+df$max_picth_dumbbell <- NULL
+
+df$kurtosis_picth_forearm <- df$kurtosis_pitch_forearm
+df$kurtosis_picth_forearm <- NULL
+
+df$max_picth_forearm <- df$max_pitch_forearm
+df$max_picth_forearm <- NULL
+```
+
+### Deleting columns having no useful prediction value
+
+Direct inspection of the head of the raw data, has revealed that several 
+columns contain only garbage.  Such columns are expected to have zero or nearly
+no value for prediction purposes. They should be deleted.
+
+```{r DeleteUselessColumns}
+omitnames <- c('X','user_name','raw_timestamp_part_1',
+               'raw_timestamp_part_2','cvtd_timestamp','new_window',
+               'kurtosis_yaw_belt','skewness_yaw_belt','amplitude_yaw_belt',
+               'kurtosis_yaw_dumbbell','max_yaw_dumbbell',
+               'min_yaw_dumbbell','amplitude_yaw_dumbbell',
+               'gyros_dumbbell_x','kurtosis_yaw_forearm',
+               'skewness_yaw_forearm','amplitude_yaw_forearm')
+colnums <- function(colnames, df) {
+    allcn <- names(df)
+    sapply(colnames, function(x) which(x==allcn, arr.ind=TRUE))
+}
+omits <- colnums(omitnames, df)
+df <- df[,-omits]
+```
+
+### Transforming bad factor columns into numerics
+
+There are many columns which are factors in the raw data, but direct inspection
+has revealed that most of these columns should really be numeric data. The
+exceptions were noted in a list.  A factor to numeric conversion is applied
+to the appropriate columns.
+
+```{r FactorToNumericConversion}
+dontconvert <- c('user_name', 'cvtd_timestamp', 'new_window', 'classe')
+for (i in 1:length(df)) {
+    if (names(df[i]) %in% dontconvert == FALSE) {
+        df[,i] <- as.numeric(df[,i])
+    }
+}
+```
+
+### Creating data partitions for training and testing
+
+Below, the data is split into 2 parts, named as training and testing.
+The classe variable was the column which the data was split on.
+
+```{r CreateDataPartitions}
+ov = c('classe')
+inTr = createDataPartition(df[,ov], p=0.8, list=FALSE)
+tr = df[inTr,]
+te = df[-inTr,]
+```
+
+## Selecting columns for model training
+
+Simple code was written to search all columns at the same time 
+for pathologies including missing data, and near zero variance. The quantile()
+function and the complete.cases() function were used to find columns having
+excessive missing data. The nearZeroVar() function was used to find columns
+having unacceptably low variance.
+
+There were no attempts made at analyzing the data set one column
+at a time using typical exploratory column analysis techniques, such as 
+graphical plotting of pairs of variables in scatterplots, or histograms, 
+outliers, data distributions, or skew. 
+
+### Removing columns having too high of a proportion of missing data
+
+We will remove columns that are missing too much data. 
+This analysis is based on training set alone. 
+Below is a decile breakdown for summarizing how many columns, have how much 
+missing data. The number x is the number of NA in the column.
+
+```{r DecilesOfColumnsMissingData, results='asis'}
+x <- sapply(seq(1,dim(tr)[2]), function(j) sum(is.na(tr[,j])))
+q = quantile(x, probs=seq(0, 1, 0.10))
+xt = xtable(data.frame(q))
+print(xt, type='html')
+```
+
+The columns which are missing data in 20% of rows,
+are also the same columns missing data in 90% of the rows, which is interesting.
+
+```{r}
+names(x) <- colnames(tr)
+notnacols <- names(x[x/dim(tr)[1] <= 0.20])
+
+print(length(notnacols))
+print(length(names(x[x/dim(tr)[1] <= 0.90])))
+
+tr <- tr[,notnacols] 
+
+print(dim(tr))
+```
+
+### Removing columns having near zero variance
+
+Columns having near zero variance contain too little information to use for 
+prediction.
+
+```{r DeleteNearZeroVarianceColumns}
+x <- nearZeroVar(tr)
+tr <- tr[,-x]
+print(dim(tr))
+```
+
+The following are the number of rows having complete data. Interestingly
+the remaining rows all have complete data, after those data-poor columns were 
+removed.
+
+```{r CheckRowsMissingData}
+print(sum(complete.cases(tr)))
+print(dim(tr))
+```
+
+Below is the reading of the final list of column names to keep as predictor 
+variables.
+
+```{r FindPredictorVariables}
+pv = colnames(tr[, names(tr) != ov])
+numPVars = length(pv)
+numOrigVars = dim(df)[2]
+```
+
+The model training session will use `r numPVars` predictor variables out of
+`r numOrigVars` variables that were in the original raw data.
+
+### Imputing missing values, or the lack thereof
+
+The 52 predictor variables selected are missing no data. Therefore, no 
+imputation of data is performed.
+
+## Model building and selection
+
+The training data partition was used to train models and cross validate them.
+The testing data partition was only used to get an estimate of out-of-sample 
+accuracy.  The accuracy metric used was total accuracy, which was computed using 
+a confusion matrix.
+  
+A boosting tree model was the final
+model selected, on the basis of highest accuracy. Its accuracy was approximately
+99% on the training data set as well as the testing data set. This accuracy was 
+considered to be excellent and unsurpassable. Therefore no further model 
+selections and column selections were attempted. 
+  
+Early models were attempted but they were eventually abandoned. The early model
+types tried included Linear Discriminant Analysis, Random Forest, and Support 
+Vector Machine. Early models demonstrated accuracy in the range from 71% to 80%.
+  
+At the same time, the early models were also trained on a larger number of
+columns than the final model. Too many columns proved to be detrimental to 
+accuracy. The best columns to use and the best model to use, may have been 
+confounded, but no attempt was made to separate these effects. It is plausible 
+that the early, abandoned models may have shown a higher accuracy than they 
+originally demonstrated, if they had also used the final column selections.
+
+### Training the model
+
+The model is trained on the predictors. Strictly the training data set is used.
+The training time takes hours. Therefore the trained object is loaded from disk
+if it already exists, instead of doing training. The training actually is 
+performed if the file for the previously trained model is not found on the disk.
+```{r Train}
+fitfilename = 'fit'
+objname = 'fit'
+filematches = dir(pattern=fitfilename)
+if (fitfilename %in% filematches) {
+    load(file=fitfilename)
+} else {
+    ctrl = trainControl(method='repeatedcv', repeats=3, savePred=TRUE, 
+                    classProb=TRUE)
+    fit = train(y=tr[,ov], x=tr[,pv], method='gbm', preProc=c('center','scale'), 
+                metric='Accuracy', trControl=ctrl, verbose=FALSE)    
+    save(list=(objname), file=fitfilename)
+}
+```
+
+### Controlling prediction error
+
+The following error mitigation and analysis techniques were used:
+
+- The data was partitioned into a training and a testing set.  
+The training of the model and its cross validation used the training set only.
+The testing set was held back and was not used for training nor for 
+cross validations that were performed during model encoding.
+
+- A confusion matrix and the associated accuracy percentage, were the primary
+model quality assessment criteria.  
+
+- Accuracy of the model was first assessed on predictions made using
+training data. Accuracy was also assessed on predictions made using testing data, 
+while still using the model instance and coefficients that were
+already encoded using training data.
+
+- Cross validation of type "repeatedCV" in the train function of caret package,
+was used during model training. This helped to avoid overfitting the model.
+
+- The out-of-sample accuracy was approximately 71% to 80% on preliminary models,
+99% on the final model, and 100% on the 20 graded predictions that were required
+to be submitted for this assignment.
+
+- For this study, there were no attempts at analyzing the data set one column
+at a time, using typical column analysis techniques like graphical plotting of 
+scatterplots, histograms, outliers, data distributions, or skew. Instead, all 
+columns were searched at the same time, using code, for problems such as 
+missing data and near zero variance. The reason was mainly because there were 
+too many columns in this data set to analyze individually given the relatively 
+low time availability for doing this course project. In the end this strategy 
+worked out very satisfactorily, because the accuracy of the final model 
+was excellent. 
+
+
+### Predictions using training data
+
+First, predictions are made using the training data observations. In other words
+this is an in-sample prediction. This is the same data the model was trained on,
+so the predictions may be optimistic. The model is just predicting, per se, 
+using data it has already seen. Despite this, the in-sample prediction will not
+be perfect. Generalization is the goal of creating this model, not memorization.
+
+The final model was cross-validated on sub-partitions of this training data set.
+  
+A confusion matrix generates the overall accuracy percentage of the predictions.
+Since we are not particularly interested in a detailed break-out of the 
+classwise accuracy scores, we will just print the overall accuracy.
+
+```{r PredictOnTrainingData}
+pred = predict(fit, tr[,pv])
+cm = confusionMatrix(data=pred, reference=tr[,ov])
+print(cm$overall['Accuracy'])
+```
+
+### Predictions using testing data
+
+Finally, predictions are made using the testing data. This is a more legitimate
+out-of-sample prediction. The trained model has never seen this data before.
+The true prediction power of the model will be more realistically assessed here.
+
+```{r PredictOnTestingData}
+pred = predict(fit, te[,pv])
+cm = confusionMatrix(data=pred, reference=te[,ov])
+print(cm$overall['Accuracy'])
+```
+
+## Conclusions
+
+- The **boosted tree model demonstrated excellent accuracy**, significantly better 
+than the random forest, linear discriminant analysis, and support vector machine.
+Accuracy of the boosted tree final model was also excellent on out-of-sample 
+data, possibly due to the repeated cross validation preprocessing that was used.
+
+- The repeated cross validation may have been confounded with model selection 
+in terms of what aspect of the final model really most strongly contributed to 
+the excellent accuracy level of the final model since they were introduced into
+the analysis at the same time. Assessment was not performed on the confounding
+of the model algorithm and the validation algorithm as regards prediction 
+accuracy. In other words the **repeated cross validation** might be even more 
+important than the choice of the final model algorithm -- the boosted tree -- 
+but this is not known yet.
+
+- As well, the **best columns to use** and the best model algorithm to use may have 
+been confounded, but no attempt was made to separate these effects. It is 
+plausible that some of the early, abandoned models may have shown a higher 
+accuracy than they originally demonstrated, using the final column selections.
+
+- It is plausible that BoxCox preprocessing to improve normality of column data
+could have been beneficial to use on the final column selections. BoxCox took
+too much computing time to be finish on the larger, earlier column selections,
+so it was abandoned.
+
+- It is plausible that **even fewer columns** could have been used in the final 
+model. Further reduction in columns for predictors in the final model could 
+potentially result in higher accuracy, or reduced training times, or lower 
+variance of predictions. Lasso regularization, principal component analysis,
+linear regression modeling and outlier analysis and diagnostics analysis, as
+well as continued analysis of individual columns, are all believed to be among the 
+remaining ways to possibly improve model column selection even further.
+
+- Given the excellent accuracy of results that were obtained with fairly simple
+code-based column selections, in future analyses, even on smaller data sets with
+fewer columns and more time available to work on the analysis, I would still 
+prefer to start any column selection process using code to search all columns at 
+the same time for missing data and near zero variance. After that, but only if 
+needed based on accuracy assessments, the remaining columns could then be 
+analyzed more carefully for other pathologies such as outlier influence, 
+normality of data distribution, on an individual column basis.
+
+- The computing resources needed were surprisingly high, for training especially, 
+and for certain kinds of preprocessing like BoxCox. The workstation used
+for model training often approached **100% of computer capacity** for processor
+utilization, memory, and disk swap space. Time blocks of one hour, two hours, and
+even upwards of six hours of dedicated computer time were required at points 
+during preprocessing and model building.
+
+- **Code was parallelized** for final model development. The library doMC was used.
+**The doMC library proved effective and simple to include**. Additional processors
+were shown to be utilized during model training, by viewing the CPU levels with 
+System Monitor tool. Three processors were used for training and the one 
+remaining processor processor core was left unloaded to allow continued 
+processing for the operating system and other work.
+
+- **It proved especially helpful to use iris**, a simpler, completely unrelated data 
+set, **for prototyping the final model building code.** During the final model 
+building efforts, instead of using of the actual data set being analyzed, 
+the iris dataset increasingly began to be used to help develop R code for the
+purpose of making faster code development decisions while arriving at the most
+effective machine learning code design for this analysis. The code was 
+subsequently run on the correct data set after being developed on iris. Going 
+forward, using small but sufficiently similar data sets
+will be my preferred technique, and I will use it sooner in the analysis.  
+I now believe some time could have been saved during this analysis by using the 
+iris dataset sooner to prototype the exploratory, and initial model building,
+and final model building code, for subsequent application to the correct data set.
+
+- There are reports of remote leased remote computer instances, such as 
+Amazon.com, being used to good effect for even larger machine learning analysis
+efforts on larger data sets. Such temporary use of much higher power leased 
+computing resources is believed to be a good potential alternative to locally 
+available computer workstations on short notice if local computing power proves
+to be insufficient despite all best efforts.
+
+
+## Generating 20 Graded Predictions
+
+The model generated by the analysis is used to produce the required 20 
+predictions on a set of 20 observations provided by the course instructor. 
+Out-of-sample accuracy is super-important for this analysis because the course 
+final grade is directly associated with the model's accuracy on these 20 
+observations.
+
+```{r graded}
+gradedf <- read.csv('pml-testing.csv', header=TRUE)
+gnames = setdiff(names(tr),'classe') # remove column classe
+gnames = c(gnames, 'problem_id') # add column problem_id
+gte = gradedf[, gnames]
+pred = predict(fit, gte[,pv])
+gte$pred = pred # add column pred to the dataframe
+gte$answers = as.character(gte[,54])
+source('pml_write_files.R')
+pml_write_files(gte$answers)
+```
